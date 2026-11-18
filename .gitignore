@@ -1,0 +1,8 @@
+# Do not track the data directory
+data/
+
+# Following are the other standard files that should be ignored in a Python project including the venv directory, compiled Python files, and cache directories.
+ewh/
+__pycache__/
+*.pyc
+venv/
