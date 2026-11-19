@@ -37,7 +37,52 @@ The CSV retains the original daily resolution regardless of the heatmap bins.
 
 ## Main IPF model
 
-Run `python src/ipf_joint_table.py` to process all clusters. Use 
-`--clusters "City" "Greece"` to select clusters and `--metric Tix` to save ticket counts 
-instead of the default `Revenue` matrix. The output will be a semicolon-delimited CSV
-in `data/joint_tables/`.
+Run `python src/ipf_joint_table.py` to process all clusters, or use
+`--clusters "City" "Greece"` to select clusters. The script saves two
+semicolon-delimited CSVs in `data/output/`, with tickets and revenue formatted
+to six decimal places. Their names include the cluster name for a single
+cluster, or the initials of each cluster for multiple clusters. For example,
+the City and Greece outputs are `joint_forecast_2026_C_G.csv` and
+`joint_forecast_2026_C_G_filtered.csv`. Use `--output` to set a different base
+path; the cluster label and `_filtered` suffix are still appended.
+Different cluster selections can have the same initials; use different base
+paths if those outputs need to be kept separately.
+
+The full output includes carry-in and carry-out dates. The filtered output
+retains only rows whose booking and flight dates both appear in their respective
+forecasts for that cluster, so its margins need not match the forecasts. Rounding
+the exported values can also introduce small differences in aggregate totals.
+
+A booking-date comparison is saved in `data/output/comparison/`, using the
+saved filtered table and the clean, sorted booking forecast for the fitted clusters.
+It sums across clusters, includes dates present on either side, and reports
+filtered total minus forecast for both tickets and revenue. With a custom
+`--output`, the comparison directory is alongside that output instead.
+Use `--post-process-only data/output/joint_forecast_2026_Canaries_filtered.csv`
+to compare an existing filtered table without fitting. Clusters are inferred
+from the table unless `--clusters` is specified; specify clusters explicitly if
+the table is empty or a fitted cluster has no filtered rows. This mode does not
+recreate the fitting summary.
+
+## Booking-to-flight correlations
+
+Run `python src/correlations.py --ipf-output data/output/joint_forecast_2026_Canaries_filtered.csv --clusters Canaries`
+to compare one or more clusters. Omit `--clusters` to compare all clusters in
+the selected filtered output. `--metric Revenue` plots revenue instead of the
+default Tix; `--actuals` and `--plot-dir` override the default paths. The script
+prints the weighted Pearson correlation of booking and flight month numbers for
+both metrics, their forecast values, and forecast-minus-actual differences.
+
+For each heatmap cell, the value is the weighted Pearson correlation between the
+two binary indicators “booking month is b” and “flight month is f”. Weights are
+the Tix or Revenue totals in the joint table. The plots use a common −1 to 1
+scale; grey means an indicator is constant and its correlation is undefined.
+Only same-calendar-year booking/flight pairs are included on both sides, with
+historical years pooled. The forecast's filtered scope excludes carry-in and
+carry-out, so the comparison does not describe the full forecast. The printed
+scalar treats months as linear numbers, so December and January are far apart;
+it should not be interpreted as a circular seasonal correlation.
+
+For programmatic use, `analyze_cluster(actuals, forecast, cluster)` accepts
+DataFrames and returns a scalar summary and the Tix and Revenue indicator
+matrices. `plot_correlations` saves the selected side-by-side heatmap.

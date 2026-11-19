@@ -13,6 +13,7 @@ Per cluster:
 from __future__ import annotations
 
 import argparse
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,7 +35,7 @@ SMOOTH_SIGMA = 2.0        # Gaussian smoothing along the lead axis (days)
 SHRINK_K = 200.0          # pseudo-Tix pulling sparse months to the cluster profile
 PRIOR_FLOOR = 1e-6        # keeps all allowed cells > 0 (IPF cannot revive zeros)
 BUCKET_EDGES = [7, 30, 90, 180]   # lead buckets: 0-7, 8-30, 31-90, 91-180, 181+
-TOL, MAX_ITER = 1e-10, 5000
+TOL, MAX_ITER = 1e-10, 2000
 
 
 # ---------------------------------------------------------------- loading
@@ -75,7 +76,7 @@ def build_prior(act: pd.DataFrame, data_end: pd.Timestamp) -> Prior:
     L = lead_cap(act)
     print(f"Lead cap = {L} days")
     # Right-censoring: keep bookings whose full lead window [b, b+L] is observed.
-    hist = act[act["BookingDate"] + pd.Timedelta(days=L) <= data_end] # not much sense as all the transactions in actuals anyways have flight date <= data_end and so this will always return the whole actuals.
+    hist = act[act["BookingDate"] + pd.Timedelta(days=L) <= data_end] # for the given actuals it might not make much sense as all the transactions in actuals anyways have flight date <= data_end.
     if hist.empty:
         print(f"Warning: no bookings with BookingDate + {L} <= {data_end.date()}; using all actuals")
         hist = act
@@ -163,7 +164,7 @@ def _factors(current: np.ndarray, target: np.ndarray, fixed: np.ndarray) -> np.n
 def ipf(seed, row_t, col_t, row_fixed, col_fixed) -> tuple[np.ndarray, int, float]:
     """Scale fixed margins alternately, leaving carry-in/out margins free.
     Inputs:
-        seed: initial table with weidhted lead-time prior (booking month × lead time) for the allowed cells in the grid.
+        seed: initial table with weighted lead-time prior (booking month × lead time) for the allowed cells in the grid.
         row_t: target row sums (booking forecast)
         col_t: target column sums (flight forecast)
         row_fixed: this is a boolean array indicating which rows have fixed targets (i.e., which rows correspond to the booking forecast for the current year).
@@ -171,10 +172,10 @@ def ipf(seed, row_t, col_t, row_fixed, col_fixed) -> tuple[np.ndarray, int, floa
     Outputs:
         x: the fitted table after IPF, which should have row sums close to row_t and column sums close to col_t for the fixed rows and columns.
         it: the number of iterations taken to converge
-        err: this is the maximum absolute error in the fixed-row sums, normalized by the total target for those rows. It gives a sense of how well the fitted table matches the booking forecast.
+        err: this is the maximum absolute error between the fixed-row and fixed-column sums. It gives a sense of how well the fitted table matches the booking forecast.
     Error is now the maximum between the fixed-row absolute error and the fixed-column absolute error, divided by the total fixed-row and fixed-column targets respectively. 
     This is a more balanced measure of how well the fitted table matches both the booking and flight forecasts.
-    Reaching MAX_ITER does not raise.
+    Reaching MAX_ITER does not raise an error.
     Positive support for each margin alone does not establish feasibility.
     """
     dead_r = row_fixed & (row_t > 0) & (seed.sum(1) == 0)
@@ -217,6 +218,95 @@ def fit_cluster(act, bfc, ffc, data_end) -> tuple[Grid, Prior, np.ndarray, np.nd
 
 
 # ---------------------------------------------------------------- output & checks
+def output_paths(base: Path, clusters: list[str]) -> tuple[Path, Path]:
+    """Append the fitted cluster name or cluster initials to both output paths."""
+    words = [re.findall(r"[A-Za-z0-9]+", cluster) for cluster in sorted(clusters)]
+    if any(not parts for parts in words):
+        raise ValueError("Cluster names must contain letters or digits")
+    if len(words) == 1:
+        label = "_".join(words[0])
+    else:
+        label = "_".join("".join(word[0].upper() for word in parts) for parts in words)
+    full = base.with_name(f"{base.stem}_{label}{base.suffix}")
+    filtered = full.with_name(f"{full.stem}_filtered{full.suffix}")
+    return full, filtered
+
+
+def filter_to_forecasts(out: pd.DataFrame, bfc: pd.DataFrame, ffc: pd.DataFrame) -> pd.DataFrame:
+    """Keep rows whose booking and flight dates occur in their cluster's forecasts."""
+    cluster = out["FlightMarketCluster"]
+    bookings = pd.MultiIndex.from_arrays([cluster, out["BookingDate"]])
+    flights = pd.MultiIndex.from_arrays([cluster, out["FlightDate"]])
+    booking_dates = pd.MultiIndex.from_frame(bfc[["FlightMarketCluster", "Date"]])
+    flight_dates = pd.MultiIndex.from_frame(ffc[["FlightMarketCluster", "Date"]])
+    return out[bookings.isin(booking_dates) & flights.isin(flight_dates)] # instead of a hard 'and' we can also try to use an 'or'
+    # return out[bookings.isin(booking_dates) | flights.isin(flight_dates)]
+
+
+def compare_booking_forecast(out: pd.DataFrame, bfc: pd.DataFrame) -> pd.DataFrame:
+    """Compare filtered joint-table totals with booking forecasts across clusters."""
+    aggregated = out.groupby("BookingDate")[["Tix", "Revenue"]].sum()
+    forecast = bfc.groupby("Date")[["Tix", "Revenue"]].sum()
+    # only compare based on the forecast booking dates
+    comparison = aggregated.rename(columns=lambda name: f"{name}_aggregated").join(forecast.rename(columns=lambda name: f"{name}_forecast"), how="right").fillna(0).sort_index()
+    comparison["Tix_error"] = comparison["Tix_aggregated"] - comparison["Tix_forecast"]
+    # Report both errors with a rounding off to 6 decimal places
+    comparison["Tix_error"] = comparison["Tix_error"].round(6)
+    comparison["Revenue_error"] = comparison["Revenue_aggregated"] - comparison["Revenue_forecast"]
+    comparison["Revenue_error"] = comparison["Revenue_error"].round(6)
+    comparison.index.name = "BookingDate"
+    return comparison.reset_index()[["BookingDate", "Tix_aggregated", "Tix_forecast",
+                                     "Revenue_aggregated", "Revenue_forecast",
+                                     "Tix_error", "Revenue_error"]]
+
+# TODO: similarly compare the filtered joint-table totals with flight forecasts across clusters.
+def compare_flight_forecast(out: pd.DataFrame, ffc: pd.DataFrame) -> pd.DataFrame:
+    """Compare filtered joint-table totals with flight forecasts across clusters."""
+    aggregated = out.groupby("FlightDate")[["Tix", "Revenue"]].sum()
+    forecast = ffc.groupby("Date")[["Tix", "Revenue"]].sum()
+    # only compare based on the forecast flight dates
+    comparison = aggregated.rename(columns=lambda name: f"{name}_aggregated").join(forecast.rename(columns=lambda name: f"{name}_forecast"), how="right").fillna(0).sort_index()
+    comparison["Tix_error"] = comparison["Tix_aggregated"] - comparison["Tix_forecast"]
+    # Report both errors with a rounding off to 6 decimal places
+    comparison["Tix_error"] = comparison["Tix_error"].round(6)
+    comparison["Revenue_error"] = comparison["Revenue_aggregated"] - comparison["Revenue_forecast"]
+    comparison["Revenue_error"] = comparison["Revenue_error"].round(6)
+    comparison.index.name = "FlightDate"
+    return comparison.reset_index()[["FlightDate", "Tix_aggregated", "Tix_forecast",
+                                     "Revenue_aggregated", "Revenue_forecast",
+                                     "Tix_error", "Revenue_error"]]
+
+
+def save_booking_comparison(filtered_path: Path, clusters: list[str] | None = None) -> Path:
+    """Compare a saved filtered table with the clean forecast for its clusters."""
+    out = pd.read_csv(filtered_path, sep=";", parse_dates=["BookingDate", "FlightDate"])
+    if clusters is None:
+        clusters = out["FlightMarketCluster"].dropna().unique().tolist()
+    if not clusters:
+        raise ValueError("Cannot determine clusters from an empty filtered table; specify --clusters")
+    out = out[out["FlightMarketCluster"].isin(clusters)]
+    bfc = load_forecast(BOOKING_FC_FILE)
+    ffc = load_forecast(FLIGHT_FC_FILE)
+    bfc = bfc[bfc["FlightMarketCluster"].isin(clusters)]
+    ffc = ffc[ffc["FlightMarketCluster"].isin(clusters)]
+    comparison = compare_booking_forecast(out, bfc)
+    comparison_ffc = compare_flight_forecast(out, ffc)
+    # print the ten highest absolute errors in the comparison for both Tix and Revenue
+    print("Top 10 Tix errors compared to booking forecast:")
+    print(comparison.reindex(comparison["Tix_error"].abs().sort_values(ascending=False).head(10).index))
+    print("Top 10 Tix errors compared to flight forecast:")
+    print(comparison_ffc.reindex(comparison_ffc["Tix_error"].abs().sort_values(ascending=False).head(10).index))
+    # print(comparison.reindex(comparison["Revenue_error"].abs().sort_values(ascending=False).head(10).index))
+    path = filtered_path.parent / "comparison" / f"{filtered_path.stem}_booking_comparison.csv"
+    path_ffc = filtered_path.parent / "comparison" / f"{filtered_path.stem}_flight_comparison.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    comparison.to_csv(path, sep=";", index=False, date_format="%Y-%m-%d")
+    comparison_ffc.to_csv(path_ffc, sep=";", index=False, date_format="%Y-%m-%d")
+    print(f"Saved {len(comparison):,} booking comparison rows -> {path}")
+    print(f"Saved {len(comparison_ffc):,} flight comparison rows -> {path_ffc}")
+    return path
+
+
 def to_long(grid: Grid, tix: np.ndarray, rev: np.ndarray, cluster: str) -> pd.DataFrame:
     i, j = np.nonzero(tix > 1e-12)
     return pd.DataFrame({"BookingDate": grid.bookings[i], "FlightDate": grid.flights[j],
@@ -229,8 +319,6 @@ def margin_error(out: pd.DataFrame, fc: pd.DataFrame, date_col: str) -> dict[str
     exp = fc.set_index("Date")[["Tix", "Revenue"]]
     # Include dates that occur in either the produced output or forecast.
     idx = got.index.union(exp.index)
-    # TODO: Current limitation: this returns one maximum across both tickets and revenue. 
-    # Because tickets and euros are different units, separate errors would be easier to interpret.
     errors = (got.reindex(idx, fill_value=0) - exp.reindex(idx, fill_value=0)).abs()
     return {"Tix": float(errors["Tix"].to_numpy().max()) if not errors.empty else 0.0, 
             "Revenue": float(errors["Revenue"].to_numpy().max()) if not errors.empty else 0.0}
@@ -246,20 +334,29 @@ def summarize(out, act, bfc, ffc, data_end, prior, info, cluster) -> dict:
     cells = out[out["Tix"] >= 0.1]
     cells_aov = cells["Revenue"] / cells["Tix"]
     ratio = cells_aov / fc_aov
+    booking_errors = margin_error(out, bfc, "BookingDate")
+    flight_errors = margin_error(out, ffc, "FlightDate")
     return dict(cluster=cluster, **info,
-                max_err_booking=margin_error(out, bfc, "BookingDate"),
-                max_err_flight=margin_error(out, ffc, "FlightDate"),
+                max_err_booking_tix=booking_errors["Tix"], max_err_booking_rev=booking_errors["Revenue"],
+                max_err_flight_tix=flight_errors["Tix"], max_err_flight_rev=flight_errors["Revenue"],
                 carry_in_share=out.loc[out["BookingDate"].dt.year < YEAR, "Tix"].sum() / ffc["Tix"].sum(),
                 carry_out_share=out.loc[out["FlightDate"].dt.year > YEAR, "Tix"].sum() / bfc["Tix"].sum(),
-                hist_carry_out_share=hist_out,
+                hist_carry_out_share=hist_out, # since actuals data spans multi-year, it can also tell us how many tickets are carried out to the next year from the current year.
                 aov_flag_share=cells.loc[(ratio < 1 / 3) | (ratio > 3), "Tix"].sum() / out["Tix"].sum())
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--clusters", nargs="+", help="Clusters to fit (default: all)")
-    parser.add_argument("--output", type=Path, default=OUTPUT_FILE)
+    parser.add_argument("--output", type=Path, default=OUTPUT_FILE,
+                        help="Base output path; fitted cluster names are appended")
+    parser.add_argument("--post-process-only", type=Path, metavar="FILTERED_CSV",
+                        help="Only compare an existing filtered joint table; do not fit")
     args = parser.parse_args()
+
+    if args.post_process_only:
+        save_booking_comparison(args.post_process_only, args.clusters)
+        return
 
     act = load_actuals(ACTUALS_FILE)
     bfc, ffc = load_forecast(BOOKING_FC_FILE), load_forecast(FLIGHT_FC_FILE)
@@ -270,6 +367,7 @@ def main() -> None:
     for cluster in clusters:
         a, b, f = (d[d["FlightMarketCluster"] == cluster] for d in (act, bfc, ffc))
     
+        print(f"\nFitting cluster {cluster} ({len(a):,} actuals, {len(b):,} booking fc, {len(f):,} flight fc rows)")
         try:
             grid, prior, tix, rev, info = fit_cluster(a, b, f, data_end)
         except ValueError as exc:
@@ -279,14 +377,16 @@ def main() -> None:
         results.append(out)
         summaries.append(summarize(out, a, b, f, data_end, prior, info, cluster))
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
     result = pd.concat(results).sort_values(["FlightMarketCluster", "BookingDate", "FlightDate"])
-    result.to_csv(args.output, sep=";", index=False, date_format="%Y-%m-%d")
+    filtered = filter_to_forecasts(result, bfc, ffc)
+    full_path, filtered_path = output_paths(args.output, [summary["cluster"] for summary in summaries])
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+    for frame, path in ((result, full_path), (filtered, filtered_path)):
+        frame.to_csv(path, sep=";", index=False, date_format="%Y-%m-%d", float_format="%.6f")
+        print(f"Saved {len(frame):,} rows -> {path}")
     print(pd.DataFrame(summaries).round(6).to_string(index=False))
-    print(f"Saved {len(result):,} rows -> {args.output}")
+    save_booking_comparison(filtered_path, [summary["cluster"] for summary in summaries])
 
 
 if __name__ == "__main__":
     main()
-    # TODO: Round off the Tix and Revenue values in the final CSV output to 4 decimal places. 
-    # Then make sure that the name of the output csv contains the cluster name (if all clusters present, then no need) so that its easy to identify.

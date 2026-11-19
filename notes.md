@@ -31,3 +31,9 @@ Rows from the raw flight forecast data where Revenue is zero:
            Date FlightMarketCluster  Tix  Revenue
 811  2026-05-29            Canaries    2        0
 1914 2026-11-23             Balkans    1        0
+
+## Some limitations of the current approach:
+- The current output table doesnt seem to have any Tix value greater than or equal to 1. Also, the revenue in the output table seems to be very low compared to the revenue in the forecasts. Need to check the IPF script for any fundamental issues. - This is because the Tix and Revenue values get proportionately distributed across allowed cells in the output table. The output table is not a forecast but a joint bookings-flights table that is consistent with the forecasts. The Tix and Revenue values in the output table are not expected to match the forecasts as forecasts have them aggregated by single "date" dimension.
+- How to present the final table as it is too long? Also there is an output table produced with carry-in and out rows and columns. Can I send a section of the table, for instance a few clusters only. Or shall I use some compressed representation of the table? - The output table can be stored in a CSV file and shared. The filtered output table can be used for further analysis and correlation calculations. 
+- Booking Period comparison: Compare the Tix or Revenue from the unfiltered output csv with the Booking forecasts. Plot the Tix and Revenue error on a monthly basis.
+- Flight Period Comparison: Similar to above but with the flight forecasts.
