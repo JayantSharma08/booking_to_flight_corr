@@ -9,6 +9,16 @@ Run `python src/plots.py` from the project root to update the month columns in
 the clean actuals CSV and save plots for all clusters in `plots/`. Use
 `python src/plots.py --clusters "City" "Greece" --size-variable Revenue` to
 select clusters and size bubbles by revenue; the default size is `Tix`.
+Use `python src/plots.py --forecast_lead_times` to plot only revenue by lead
+time from the unfiltered joint forecast. Add `--clusters "City" "Greece"`
+to select forecast clusters; otherwise all forecast clusters are plotted.
+
+Use `python src/plots.py --forecast-booking-flight-months --clusters "City"`
+to plot booking versus flight months for 2026 bookings in the unfiltered joint
+forecast. Add `--size-variable Revenue` to size bubbles by revenue instead of
+tickets. Flights after 2026 appear in the `Later year` row. Forecast filenames
+end in `_forecast`, so they do not overwrite historical plots. Omit `--clusters`
+to plot all forecast clusters.
 
 Month plots combine booking years. Same-year flights are grouped by their flight
 month; all flights in a later year are combined in the separate `Later year` row
@@ -37,6 +47,26 @@ The CSV retains the original daily resolution regardless of the heatmap bins.
 
 ## Main IPF model
 
+The model fits each market cluster separately. Rows represent booking dates;
+columns represent flight dates. IPF alternately scales the 2026 booking rows
+and flight columns to their forecast totals, stopping at the error tolerance or
+the iteration limit.
+
+```mermaid
+flowchart LR
+	H[Historical patterns] --> S[Initial ticket distribution]
+	F[Booking and flight forecasts] --> S
+	S --> I["IPF: fit tickets<br/>Seed revenue using historical AOV<br/>Fit revenue"]
+	H --> I
+	F --> I
+	I --> J["Joint table<br/>Booking date x flight date"]
+```
+
+Carry-in booking rows and carry-out flight columns are free margins: they are
+not scaled to 2026 forecast totals. The lead-time grid excludes cells outside
+both forecast years. Reaching the iteration limit does not guarantee that the
+forecast margins match.
+
 Run `python src/ipf_joint_table.py` to process all clusters, or use
 `--clusters "City" "Greece"` to select clusters. The script saves two
 semicolon-delimited CSVs in `data/output/`, with tickets and revenue formatted
@@ -63,6 +93,11 @@ to compare an existing filtered table without fitting. Clusters are inferred
 from the table unless `--clusters` is specified; specify clusters explicitly if
 the table is empty or a fitted cluster has no filtered rows. This mode does not
 recreate the fitting summary.
+
+Run `python src/post_processing.py --booking-revenue-difference-only` to plot
+daily 2026 booking forecast revenue minus 2025 actual revenue for the same
+calendar date, summed across clusters. Missing dates are shown as gaps. This
+option does not run the other post-processing plots.
 
 ## Booking-to-flight correlations
 

@@ -115,6 +115,95 @@ class PlotTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Tix"):
             plots.month_relationship_totals(data, "City", "Tix")
 
+    def test_forecast_mode_computes_leads_and_only_plots_selected_clusters(self) -> None:
+        root = Path(self.directory.name)
+        forecast = root / "forecast.csv"
+        pd.DataFrame({
+            "BookingDate": ["2025-12-31", "2026-01-01", "2026-01-01", "2026-01-01"],
+            "FlightDate": ["2026-01-01", "2026-01-08", "2026-01-09", "2026-01-09"],
+            "FlightMarketCluster": ["City", "City", "City", "Other"],
+            "Revenue": [10, 20, 40, 1000],
+        }).to_csv(forecast, sep=";", index=False)
+        output = root / "forecast_plots"
+        heights = []
+        original_bar = matplotlib.axes.Axes.bar
+
+        def capture_bar(axis, x, height, *args, **kwargs):
+            heights.extend(height)
+            return original_bar(axis, x, height, *args, **kwargs)
+
+        with (patch.object(plots, "FORECAST_FILE", forecast),
+              patch.object(plots, "ACTUALS_FILE", root / "missing.csv"),
+              patch.object(plots, "PLOT_DIR", output),
+              patch("sys.argv", ["plots.py", "--forecast_lead_times", "--clusters", "City"]),
+              patch.object(matplotlib.axes.Axes, "bar", autospec=True, side_effect=capture_bar)):
+            plots.main()
+        self.assertEqual(heights, [30, 40, 0, 0, 0])
+        self.assertEqual([p.name for p in output.iterdir()], ["lead_time_revenue_joint_forecast_City.png"])
+        self.assertEqual((output / "lead_time_revenue_joint_forecast_City.png").read_bytes()[:8],
+                         b"\x89PNG\r\n\x1a\n")
+
+    def test_forecast_mode_rejects_negative_lead_times(self) -> None:
+        forecast = Path(self.directory.name) / "forecast.csv"
+        pd.DataFrame({
+            "BookingDate": ["2026-01-02"], "FlightDate": ["2026-01-01"],
+            "FlightMarketCluster": ["City"], "Revenue": [10],
+        }).to_csv(forecast, sep=";", index=False)
+        with (patch.object(plots, "FORECAST_FILE", forecast),
+              patch("sys.argv", ["plots.py", "--forecast_lead_times"]),
+              self.assertRaises(SystemExit)):
+            plots.main()
+
+    def test_forecast_months_include_only_2026_bookings(self) -> None:
+        root = Path(self.directory.name)
+        forecast = root / "forecast.csv"
+        pd.DataFrame({
+            "BookingDate": ["2025-01-01", "2026-01-01", "2026-01-01",
+                            "2027-01-01", "2026-01-01"],
+            "FlightDate": ["2026-02-01", "2026-02-01", "2027-02-01",
+                           "2027-02-01", "2026-02-01"],
+            "FlightMarketCluster": ["City", "City", "City", "City", "Other"],
+            "Tix": [100, 2, 3, 100, 100],
+            "Revenue": [1000, 20, 30, 1000, 1000],
+        }).to_csv(forecast, sep=";", index=False)
+        output = root / "forecast_plots"
+        actual_totals = plots.month_relationship_totals
+        captured_totals = []
+
+        def capture_totals(data, cluster, metric):
+            totals = actual_totals(data, cluster, metric)
+            captured_totals.append(totals)
+            return totals
+
+        with (patch.object(plots, "FORECAST_FILE", forecast),
+              patch.object(plots, "ACTUALS_FILE", root / "missing.csv"),
+              patch.object(plots, "PLOT_DIR", output),
+              patch.object(plots, "month_relationship_totals", side_effect=capture_totals)):
+            for metric in ("Tix", "Revenue"):
+                with patch("sys.argv", ["plots.py", "--forecast-booking-flight-months",
+                                        "--clusters", "City", "--size-variable", metric]):
+                    plots.main()
+
+        for totals, metric, values in zip(captured_totals, ("Tix", "Revenue"), ([2, 3], [20, 30])):
+            self.assertEqual(totals["BookingMonth"].tolist(), [1, 1])
+            self.assertEqual(totals["FlightMonthGroup"].tolist(), [2, 13])
+            self.assertEqual(totals[metric].tolist(), values)
+            path = output / f"booking_flight_month_City_{metric}_forecast.png"
+            self.assertEqual(path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+        self.assertEqual(len(list(output.iterdir())), 2)
+
+    def test_forecast_months_reject_unknown_cluster(self) -> None:
+        forecast = Path(self.directory.name) / "forecast.csv"
+        pd.DataFrame({
+            "BookingDate": ["2026-01-01"], "FlightDate": ["2026-01-02"],
+            "FlightMarketCluster": ["City"], "Tix": [1], "Revenue": [10],
+        }).to_csv(forecast, sep=";", index=False)
+        with (patch.object(plots, "FORECAST_FILE", forecast),
+              patch("sys.argv", ["plots.py", "--forecast-booking-flight-months",
+                                 "--clusters", "Unknown"]),
+              self.assertRaises(SystemExit)):
+            plots.main()
+
 
 if __name__ == "__main__":
     unittest.main()

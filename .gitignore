@@ -6,3 +6,6 @@ ewh/
 __pycache__/
 *.pyc
 venv/
+
+#  no need to upload the plots directory contents to the repository, as they can be generated from the data and code.
+plots/

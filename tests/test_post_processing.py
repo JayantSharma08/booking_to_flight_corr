@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
+import matplotlib.axes
 
 from src import post_processing as post
 
@@ -80,6 +81,62 @@ class ErrorPlotTests(unittest.TestCase):
             self.assertEqual(errors.loc["2026-01-01", "Revenue_error"], -3.0)
             self.assertTrue(pd.isna(errors.loc["2026-02-01", "Tix_error"]))
             self.assertEqual(errors.loc["2027-01-01", "Tix_error"], 10.0)
+
+
+class BookingRevenueDifferenceTests(unittest.TestCase):
+    def test_daily_totals_align_dates_and_preserve_missing_values(self) -> None:
+        actuals = pd.DataFrame({
+            "BookingDate": pd.to_datetime([
+                "2025-01-01", "2025-01-01", "2025-01-02", "2025-12-31", "2024-01-01",
+            ]),
+            "Revenue": [10, 20, 50, 40, 1000],
+        })
+        forecast = pd.DataFrame({
+            "Date": pd.to_datetime([
+                "2026-01-01", "2026-01-01", "2026-01-02", "2026-01-03", "2025-01-01",
+            ]),
+            "Revenue": [15, 25, 30, 200, 1000],
+        })
+        difference = post.booking_revenue_difference(actuals, forecast)
+        self.assertEqual(len(difference), 365)
+        self.assertEqual(difference.loc["2026-01-01"], 10)
+        self.assertEqual(difference.loc["2026-01-02"], -20)
+        self.assertTrue(pd.isna(difference.loc["2026-01-03"]))
+        self.assertTrue(pd.isna(difference.loc["2026-12-31"]))
+
+    def test_standalone_cli_only_writes_requested_plot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            actual_path, forecast_path = root / "actuals.csv", root / "forecast.csv"
+            pd.DataFrame({"BookingDate": ["2025-01-01", "2025-01-02"], "Revenue": [100, 50]}).to_csv(
+                actual_path, sep=";", index=False,
+            )
+            pd.DataFrame({"Date": ["2026-01-01", "2026-01-03"], "Revenue": [120, 80]}).to_csv(
+                forecast_path, sep=";", index=False,
+            )
+            output = root / "comparison"
+            original_scatter = matplotlib.axes.Axes.scatter
+            captured = []
+
+            def capture_scatter(axis, x, y, *args, **kwargs):
+                captured.append((x, y))
+                return original_scatter(axis, x, y, *args, **kwargs)
+
+            with (patch.object(post, "ACTUALS_FILE", actual_path),
+                  patch.object(post, "BOOKING_FILE", forecast_path),
+                  patch.object(post, "COMPARISON_DIR", output),
+                  patch.object(post, "main") as main,
+                  patch("sys.argv", ["post_processing.py", "--booking-revenue-difference-only"]),
+                  patch.object(matplotlib.axes.Axes, "scatter", autospec=True,
+                               side_effect=capture_scatter)):
+                post.cli()
+            main.assert_not_called()
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0][0].tolist(), [pd.Timestamp("2026-01-01")])
+            self.assertEqual(captured[0][1].tolist(), [20])
+            paths = list(output.iterdir())
+            self.assertEqual([path.name for path in paths], ["booking_forecast_revenue_difference.png"])
+            self.assertEqual(paths[0].read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
 
 
 if __name__ == "__main__":

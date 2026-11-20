@@ -18,6 +18,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parent.parent
 ACTUALS_FILE = ROOT / "data" / "EWH_DummyActuals_sorted_mod_clean.csv"
+FORECAST_FILE = ROOT / "data" / "output" / "joint_forecast_2026_unfiltered.csv"
 PLOT_DIR = ROOT / "plots"
 MONTHS = list(range(1, 13))
 MONTH_LABELS = list(calendar.month_abbr)[1:]
@@ -94,7 +95,8 @@ def month_relationship_totals(
 
 
 def plot_month_relationship(
-    data: pd.DataFrame, cluster: str, size_variable: str, output_dir: Path
+    data: pd.DataFrame, cluster: str, size_variable: str, output_dir: Path,
+    *, forecast: bool = False,
 ) -> Path:
     """Plot same-year flight months and a separate later-year flight bucket."""
     totals = month_relationship_totals(data, cluster, size_variable)
@@ -119,22 +121,24 @@ def plot_month_relationship(
                 transform=ax.transAxes)
     ax.set_xticks(MONTHS, MONTH_LABELS)
     ax.set_yticks([*MONTHS, 13], [*MONTH_LABELS, "Later year"])
+    period = "2026 forecast bookings" if forecast else "all booking years"
     ax.set(xlim=(0.5, 12.5), ylim=(0.5, 13.5), xlabel="Booking month",
            ylabel="Flight month relative to booking year",
-           title=f"{cluster}: booking vs flight month (all booking years)")
+           title=f"{cluster}: booking vs flight month ({period})")
     ax.grid(alpha=0.2)
     fig.tight_layout()
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"booking_flight_month_{cluster_filename(cluster)}_{size_variable}.png"
+    suffix = "_forecast" if forecast else ""
+    path = output_dir / f"booking_flight_month_{cluster_filename(cluster)}_{size_variable}{suffix}.png"
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
 
 
 def plot_lead_time_distribution(
-    data: pd.DataFrame, cluster: str, output_dir: Path
+    data: pd.DataFrame, cluster: str, output_dir: Path, *, forecast: bool = False
 ) -> Path:
-    """Plot total booking revenue in mutually exclusive lead-time buckets."""
+    """Plot total revenue in mutually exclusive lead-time buckets."""
     cluster_data = data.loc[data["FlightMarketCluster"] == cluster].copy()
     cluster_data["bucket"] = pd.cut(
         cluster_data["lead_time_days"], bins=[-1, 7, 30, 90, 180, float("inf")],
@@ -144,12 +148,14 @@ def plot_lead_time_distribution(
 
     fig, ax = plt.subplots(figsize=(9, 5))
     ax.bar(LEAD_TIME_LABELS, revenue.reindex(LEAD_TIME_LABELS), color="steelblue")
-    ax.set(xlabel="Lead time (days)", ylabel="Total booking revenue (EUR)",
-           title=f"{cluster}: revenue by lead time (all years)")
+    title = ("Lead time distribution for joint forecast" if forecast
+             else f"{cluster}: revenue by lead time (all years)")
+    ax.set(xlabel="Lead time (days)", ylabel="Total booking revenue (EUR)", title=title)
     ax.grid(axis="y", alpha=0.2)
     fig.tight_layout()
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"lead_time_revenue_{cluster_filename(cluster)}.png"
+    prefix = "lead_time_revenue_joint_forecast" if forecast else "lead_time_revenue"
+    path = output_dir / f"{prefix}_{cluster_filename(cluster)}.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
@@ -183,7 +189,39 @@ def main() -> None:
     parser.add_argument("--clusters", nargs="+", help="Clusters to plot (default: all)")
     parser.add_argument("--size-variable", choices=("Tix", "Revenue"), default="Tix",
                         help="Bubble size measure (default: Tix)")
+    forecast_modes = parser.add_mutually_exclusive_group()
+    forecast_modes.add_argument("--forecast_lead_times", action="store_true",
+                                help="Plot only lead-time revenue distributions for the joint forecast")
+    forecast_modes.add_argument("--forecast-booking-flight-months", action="store_true",
+                                help="Plot only booking vs flight months for 2026 forecast bookings")
     args = parser.parse_args()
+    if args.forecast_booking_flight_months:
+        data = pd.read_csv(FORECAST_FILE, sep=";")
+        booking_dates = pd.to_datetime(data["BookingDate"], format="%Y-%m-%d", errors="raise")
+        if booking_dates.isna().any():
+            parser.error("Forecast booking dates must be valid")
+        data = data.loc[booking_dates.dt.year == 2026]
+        available_clusters = sorted(data["FlightMarketCluster"].unique())
+        clusters = args.clusters if args.clusters is not None else available_clusters
+        unknown = sorted(set(clusters) - set(available_clusters))
+        if unknown:
+            parser.error(f"Unknown clusters for 2026 bookings: {', '.join(unknown)}")
+        for cluster in dict.fromkeys(clusters):
+            print(f"Saved {plot_month_relationship(data, cluster, args.size_variable, PLOT_DIR, forecast=True)}")
+        return
+    if args.forecast_lead_times:
+        data = pd.read_csv(FORECAST_FILE, sep=";")
+        booking_dates = pd.to_datetime(data["BookingDate"], errors="raise")
+        flight_dates = pd.to_datetime(data["FlightDate"], errors="raise")
+        data["lead_time_days"] = (flight_dates - booking_dates).dt.days
+        if data["lead_time_days"].isna().any() or (data["lead_time_days"] < 0).any():
+            parser.error("Forecast dates must be valid and flights cannot precede bookings")
+        data["Revenue"] = pd.to_numeric(data["Revenue"], errors="raise")
+        available_clusters = sorted(data["FlightMarketCluster"].unique())
+        clusters = args.clusters if args.clusters is not None else available_clusters
+        for cluster in dict.fromkeys(clusters):
+            print(f"Saved {plot_lead_time_distribution(data, cluster, PLOT_DIR, forecast=True)}")
+        return
     # First check whether the actuals file already contains the month columns, and if not, only then add them. This avoids unnecessary writes and ensures idempotency.
     data = pd.read_csv(ACTUALS_FILE, sep=";", dtype=str, keep_default_na=False)
     if "BookingMonth" not in data.columns or "FlightMonth" not in data.columns:
